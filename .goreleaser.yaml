@@ -1,0 +1,40 @@
+version: 2
+
+project_name: gw-grab
+
+builds:
+  - id: gw-grab
+    dir: .
+    main: .
+    binary: gw-grab
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    # Asset name must contain _{os}_{arch}.tar.gz so `gw plugin install` can find
+    # it, and must pack the `gw-grab` binary (command name → `gw grab`).
+    name_template: "gw-grab_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
