@@ -58,7 +58,7 @@ func MatchRepoSlug(repos []Repo, slug string) (string, bool) {
 }
 
 // Names returns the display names (owner/repo where known, else folder name) of
-// the given repos — the candidate list handed to the model.
+// the given repos — the candidate list for the side panel.
 func Names(repos []Repo) []string {
 	out := make([]string, len(repos))
 	for i, r := range repos {
@@ -69,34 +69,6 @@ func Names(repos []Repo) []string {
 		}
 	}
 	return out
-}
-
-// BranchExamples returns up to n recent branch names from a repo's local path,
-// used as few-shot so generated names match the team's convention.
-func BranchExamples(repoPath string, n int) []string {
-	if repoPath == "" {
-		return nil
-	}
-	cmd := exec.Command("git", "-C", repoPath, "for-each-ref",
-		"--sort=-committerdate", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	var branches []string
-	seen := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		b := strings.TrimPrefix(strings.TrimSpace(line), "origin/")
-		if b == "" || b == "HEAD" || seen[b] {
-			continue
-		}
-		seen[b] = true
-		branches = append(branches, b)
-		if len(branches) >= n {
-			break
-		}
-	}
-	return branches
 }
 
 // CreateOpts are the inputs for `gw create`.

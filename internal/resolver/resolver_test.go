@@ -1,36 +1,11 @@
 package resolver
 
 import (
-	"context"
 	"testing"
 
 	"github.com/nicksenap/gw-grab/internal/capture"
 	"github.com/nicksenap/gw-grab/internal/grove"
-	"github.com/nicksenap/gw-grab/internal/llm"
 )
-
-// --- fakes ---
-
-type fakeLLM struct {
-	available bool
-	sug       *llm.Suggestion
-	err       error
-	gotReq    llm.Request
-}
-
-func (f *fakeLLM) Available(context.Context) bool { return f.available }
-func (f *fakeLLM) Suggest(_ context.Context, r llm.Request) (*llm.Suggestion, error) {
-	f.gotReq = r
-	return f.sug, f.err
-}
-
-type fakeMem struct {
-	repo string
-	ok   bool
-}
-
-func (m fakeMem) Lookup(_, _ string) (string, bool) { return m.repo, m.ok }
-func (m fakeMem) RecentMappings(int) []string       { return nil }
 
 func sampleRepos() []grove.Repo {
 	return []grove.Repo{
@@ -39,15 +14,13 @@ func sampleRepos() []grove.Repo {
 	}
 }
 
-// A GitHub PR with a DOM branch hint resolves fully and deterministically —
-// no LLM call, tracking mode on.
+// A GitHub PR with a DOM branch hint resolves fully: local repo, tracked branch.
 func TestResolve_GitHubPR_DomBranchHint(t *testing.T) {
-	llmStub := &fakeLLM{available: true} // present, but must NOT be used
-	p := Resolve(context.Background(), capture.Capture{
+	p := Resolve(capture.Capture{
 		URL:        "https://github.com/funnel-io/conversational-analytics/pull/1172",
 		Title:      "Surface data source status",
 		BranchHint: "feat/data-source-status",
-	}, Deps{Repos: sampleRepos(), LLM: llmStub})
+	}, sampleRepos())
 
 	if p.RepoName != "conversational-analytics" {
 		t.Errorf("repo = %q", p.RepoName)
@@ -58,101 +31,49 @@ func TestResolve_GitHubPR_DomBranchHint(t *testing.T) {
 	if p.Name != "feat-data-source-status" {
 		t.Errorf("name = %q", p.Name)
 	}
-	if llmStub.gotReq.Title != "" {
-		t.Error("LLM should not be called when repo+branch are known")
-	}
 }
 
-// A Notion task (no repo, no branch) uses the LLM to infer repo + name.
-func TestResolve_Notion_UsesLLM(t *testing.T) {
-	llmStub := &fakeLLM{
-		available: true,
-		sug:       &llm.Suggestion{Repo: "acme/api", Branch: "feat/data status", Confidence: 0.9},
+// A PR for a repo that isn't cloned proposes cloning it.
+func TestResolve_GitHubPR_NotCloned(t *testing.T) {
+	p := Resolve(capture.Capture{URL: "https://github.com/someone/else/pull/3"}, sampleRepos())
+	if p.RepoName != "https://github.com/someone/else.git" || len(p.Notes) != 1 {
+		t.Errorf("repo=%q notes=%v", p.RepoName, p.Notes)
 	}
-	p := Resolve(context.Background(), capture.Capture{
-		URL:   "https://app.notion.com/p/ws/Improve-the-data-API-37430a04501f8008b6e9c63e43d9a698",
-		Title: "Improve the data API",
-		Body:  "We need to add pagination to the data endpoints.",
-	}, Deps{Repos: sampleRepos(), LLM: llmStub, MinConfidence: 0.55})
-
-	if p.RepoName != "api" {
-		t.Errorf("repo = %q, want api (from LLM)", p.RepoName)
-	}
-	if p.Branch != "feat-data-status" { // slugified
+	if p.Branch != "pr-3" {
 		t.Errorf("branch = %q", p.Branch)
 	}
-	if p.Track {
-		t.Error("notion task should not be track mode")
-	}
-	if llmStub.gotReq.Body == "" {
-		t.Error("LLM should receive the page body for inference")
-	}
 }
 
-// Low confidence → do not auto-pick a repo; leave it for the panel.
-func TestResolve_LowConfidenceLeavesRepoEmpty(t *testing.T) {
-	llmStub := &fakeLLM{
-		available: true,
-		sug:       &llm.Suggestion{Repo: "acme/api", Branch: "feat/x", Confidence: 0.3},
+// A Slack message has no repo; the branch comes from the message text, or the ts.
+func TestResolve_Slack(t *testing.T) {
+	p := Resolve(capture.Capture{
+		URL:   "https://qwaya.slack.com/archives/C0FT37YHZ/p1781511693141549",
+		Title: "Data chat is slow on stage",
+	}, sampleRepos())
+	if p.RepoName != "" || p.Track {
+		t.Errorf("repo=%q track=%v", p.RepoName, p.Track)
 	}
-	p := Resolve(context.Background(), capture.Capture{
-		URL:   "https://app.notion.com/p/ws/Thing-37430a04501f8008b6e9c63e43d9a698",
-		Title: "Thing",
-	}, Deps{Repos: sampleRepos(), LLM: llmStub, MinConfidence: 0.55})
+	if p.Branch != "data-chat-is-slow-on-stage" || p.Provider != "slack" || p.SourceRef != "1781511693.141549" {
+		t.Errorf("%+v", p)
+	}
 
-	if p.RepoName != "" {
-		t.Errorf("repo = %q, want empty on low confidence", p.RepoName)
-	}
-	if len(p.Candidates) != 2 {
-		t.Errorf("candidates = %v", p.Candidates)
-	}
-}
-
-// Memory short-circuits repo selection without calling the LLM for repo.
-func TestResolve_MemoryHitSkipsRepoInference(t *testing.T) {
-	llmStub := &fakeLLM{available: true, sug: &llm.Suggestion{Branch: "feat/from-llm"}}
-	p := Resolve(context.Background(), capture.Capture{
-		URL:   "https://team.slack.com/archives/C0FT37YHZ/p1781511693141549",
-		Title: "Fix the thing",
-	}, Deps{
-		Repos:  sampleRepos(),
-		Memory: fakeMem{repo: "api", ok: true},
-		LLM:    llmStub,
-	})
-	if p.RepoName != "api" {
-		t.Errorf("repo = %q, want api from memory", p.RepoName)
-	}
-}
-
-// No LLM available and no repo hint → empty repo + a helpful note, no crash.
-func TestResolve_NoLLMNoRepo(t *testing.T) {
-	p := Resolve(context.Background(), capture.Capture{
-		URL:   "https://app.notion.com/p/ws/Thing-37430a04501f8008b6e9c63e43d9a698",
-		Title: "Thing to do",
-	}, Deps{Repos: sampleRepos(), LLM: &fakeLLM{available: false}})
-
-	if p.RepoName != "" {
-		t.Errorf("repo = %q", p.RepoName)
-	}
-	if p.Branch != "thing-to-do" {
-		t.Errorf("branch = %q, want slug fallback", p.Branch)
-	}
-	if len(p.Notes) == 0 {
-		t.Error("expected a note about picking a repo")
+	p = Resolve(capture.Capture{URL: "https://qwaya.slack.com/archives/C0FT37YHZ/p1781511693141549"}, nil)
+	if p.Branch != "slack-1781511693" {
+		t.Errorf("branch = %q", p.Branch)
 	}
 }
 
 // Unknown host still produces a usable task workspace from the title.
 func TestResolve_UnknownHost(t *testing.T) {
-	p := Resolve(context.Background(), capture.Capture{
-		URL:   "https://example.com/tickets/42",
+	p := Resolve(capture.Capture{
+		URL:   "https://grafana.example/d/abc",
 		Title: "Investigate latency",
-	}, Deps{Repos: sampleRepos(), LLM: &fakeLLM{available: false}})
+	}, sampleRepos())
 
-	if p.Branch != "investigate-latency" {
-		t.Errorf("branch = %q", p.Branch)
+	if p.Branch != "investigate-latency" || p.Name != "investigate-latency" {
+		t.Errorf("branch=%q name=%q", p.Branch, p.Name)
 	}
-	if p.SourceURL != "https://example.com/tickets/42" {
-		t.Errorf("source url = %q", p.SourceURL)
+	if p.SourceURL != "https://grafana.example/d/abc" || len(p.Candidates) != 2 {
+		t.Errorf("%+v", p)
 	}
 }

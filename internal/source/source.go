@@ -1,9 +1,7 @@
-// Package source turns a pasted URL (GitHub PR, GitLab MR, Notion page, Slack
-// message) into a SourceContext: the deterministic facts that can be extracted
+// Package source turns a URL (GitHub PR, GitLab MR, Slack message) into a SourceContext: the deterministic facts that can be extracted
 // from the URL alone, plus a slot for the metadata a resolver fetches later.
 //
-// Everything here is offline and dependency-free. Provider resolvers (which may
-// shell out to gh/glab or hit a token-authed API) live in sibling files.
+// Everything here is offline and dependency-free.
 package source
 
 import (
@@ -18,7 +16,6 @@ type Provider string
 const (
 	ProviderGitHub  Provider = "github"
 	ProviderGitLab  Provider = "gitlab"
-	ProviderNotion  Provider = "notion"
 	ProviderSlack   Provider = "slack"
 	ProviderUnknown Provider = ""
 )
@@ -41,36 +38,26 @@ type SourceContext struct {
 	RawURL   string
 
 	// RepoSlug is "owner/repo" when the URL or resolver yields one (GitHub PR,
-	// GitLab MR). Empty for Notion/Slack, where the repo is inferred later.
+	// GitLab MR). Empty for Slack and unknown pages.
 	RepoSlug string
 
-	// Ref is the provider's stable identifier: PR/MR number, Notion page id, or
-	// Slack message ts. Persisted as the workspace source ref.
+	// Ref is the provider's stable identifier: PR/MR number or Slack message ts. Persisted as the workspace source ref.
 	Ref string
 
-	// Title is a human-readable description (PR title, Notion page title, first
-	// line of a Slack message). May be empty when no metadata is available.
+	// Title is a human-readable description (PR title, first line of a Slack
+	// message). May be empty when no metadata is available.
 	Title string
 
 	// Branch is the git branch to use. For a PR it is the existing head branch
 	// (with BranchModeTrack); for task-style sources it is left empty for the
-	// LLM/slug step to fill (BranchModeCreate).
+	// slug step to fill (BranchModeCreate).
 	Branch     string
 	BranchMode BranchMode
-
-	// Signal is the stable grouping key used by repo-selection memory:
-	// the GitHub/GitLab owner, the Notion workspace slug, or the Slack channel
-	// id. Repeated grabs from the same Signal can skip repo inference.
-	Signal string
 
 	// Notes carries human-facing degradation messages for the preview
 	// (e.g. "gh unavailable — could not resolve PR head branch").
 	Notes []string
 }
-
-// notionPageID matches the trailing 32 hex chars of a Notion URL (the page id),
-// optionally dash-separated inside a longer id.
-var notionPageID = regexp.MustCompile(`([0-9a-fA-F]{32})$`)
 
 // slackTS matches a Slack message permalink id like p1781511693141549.
 var slackTS = regexp.MustCompile(`^p(\d{10})(\d{6})$`)
@@ -94,9 +81,6 @@ func ParseURL(arg string) (*SourceContext, bool) {
 		return parseGitHub(u)
 	case strings.Contains(host, "gitlab"):
 		return parseGitLab(u)
-	case host == "notion.so" || strings.HasSuffix(host, ".notion.so") ||
-		host == "notion.com" || strings.HasSuffix(host, ".notion.com"):
-		return parseNotion(u)
 	case strings.HasSuffix(host, ".slack.com") || host == "slack.com":
 		return parseSlack(u)
 	}
@@ -116,7 +100,6 @@ func parseGitHub(u *url.URL) (*SourceContext, bool) {
 		Provider:   ProviderGitHub,
 		RawURL:     u.String(),
 		RepoSlug:   owner + "/" + repo,
-		Signal:     owner,
 		BranchMode: BranchModeCreate,
 	}
 
@@ -158,7 +141,6 @@ func parseGitLab(u *url.URL) (*SourceContext, bool) {
 		Provider:   ProviderGitLab,
 		RawURL:     u.String(),
 		RepoSlug:   slug,
-		Signal:     projectParts[0],
 		BranchMode: BranchModeCreate,
 	}
 	if dashIdx >= 0 && len(parts) >= dashIdx+3 {
@@ -174,38 +156,7 @@ func parseGitLab(u *url.URL) (*SourceContext, bool) {
 	return sc, true
 }
 
-// parseNotion extracts the 32-hex page id and the human slug that precedes it.
-// No API call — the slug alone is a usable title.
-func parseNotion(u *url.URL) (*SourceContext, bool) {
-	parts := splitPath(u.Path)
-	if len(parts) == 0 {
-		return nil, false
-	}
-	last := parts[len(parts)-1]
-
-	sc := &SourceContext{
-		Provider:   ProviderNotion,
-		RawURL:     u.String(),
-		BranchMode: BranchModeCreate,
-	}
-	// Workspace slug is the first path segment for app.notion.com/<ws>/... URLs.
-	if len(parts) >= 2 {
-		sc.Signal = parts[0]
-	}
-
-	if m := notionPageID.FindStringSubmatch(last); m != nil {
-		sc.Ref = m[1]
-		// The slug is everything before the trailing (dash-joined) id.
-		slug := strings.TrimSuffix(last, m[1])
-		slug = strings.TrimRight(slug, "-")
-		sc.Title = humanizeSlug(slug)
-	} else {
-		sc.Title = humanizeSlug(last)
-	}
-	return sc, true
-}
-
-// parseSlack extracts the channel id and message ts. Offline there is no title.
+// parseSlack extracts the message ts. Offline there is no title.
 func parseSlack(u *url.URL) (*SourceContext, bool) {
 	parts := splitPath(u.Path)
 	// .../archives/<channel>/<pTs>
@@ -213,13 +164,11 @@ func parseSlack(u *url.URL) (*SourceContext, bool) {
 	if idx < 0 || len(parts) < idx+3 {
 		return nil, false
 	}
-	channel := parts[idx+1]
 	tsRaw := parts[idx+2]
 
 	sc := &SourceContext{
 		Provider:   ProviderSlack,
 		RawURL:     u.String(),
-		Signal:     channel,
 		BranchMode: BranchModeCreate,
 	}
 	if m := slackTS.FindStringSubmatch(tsRaw); m != nil {
@@ -250,11 +199,4 @@ func indexOf(ss []string, want string) int {
 		}
 	}
 	return -1
-}
-
-// humanizeSlug turns "The-agent-cannot-see" into "The agent cannot see".
-func humanizeSlug(slug string) string {
-	slug = strings.ReplaceAll(slug, "-", " ")
-	slug = strings.ReplaceAll(slug, "_", " ")
-	return strings.TrimSpace(slug)
 }

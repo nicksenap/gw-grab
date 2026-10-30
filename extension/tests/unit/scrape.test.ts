@@ -33,18 +33,6 @@ describe("scrape", () => {
     expect(cap.body).toContain("faster");
   });
 
-  it("extracts a Notion title + body", () => {
-    const d = doc(`
-      <title>Notion</title>
-      <h1 class="notion-page-title">Improve the data API</h1>
-      <div class="notion-page-content">We need pagination on the data endpoints.</div>
-    `);
-    const cap = scrape(d, { href: "https://www.notion.so/Improve-abc", hostname: "www.notion.so" });
-    expect(cap.title).toBe("Improve the data API");
-    expect(cap.body).toContain("pagination");
-    expect(cap.branchHint).toBe("");
-  });
-
   it("extracts a Slack message body", () => {
     const d = doc(`
       <div class="c-message_kit__blocks">Can we fix the flaky deploy?</div>
@@ -77,8 +65,8 @@ describe("scrape", () => {
 
   it("clips very long bodies to 4000 chars", () => {
     const long = "a".repeat(9000);
-    const d = doc(`<title>t</title><div class="notion-page-content">${long}</div>`);
-    const cap = scrape(d, { href: "https://www.notion.so/x", hostname: "www.notion.so" });
+    const d = doc(`<title>t</title><div class="comment-body">${long}</div>`);
+    const cap = scrape(d, { href: "https://github.com/a/b/pull/1", hostname: "github.com" });
     expect(cap.body.length).toBe(4000);
   });
 

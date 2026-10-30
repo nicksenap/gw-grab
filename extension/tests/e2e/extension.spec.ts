@@ -12,7 +12,6 @@ import { readFileSync } from "node:fs";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const distPath = join(dir, "..", "..", "dist");
-const FIXTURES = "http://localhost:5173";
 
 let context: BrowserContext;
 
@@ -48,7 +47,10 @@ test("extension loads and registers a service worker", async () => {
 
 test("bundled content script scrapes a GitHub PR DOM", async () => {
   const page = await context.newPage();
-  await page.goto(`${FIXTURES}/github-pr.html`);
+  // Serve the fixture at a real github.com URL: scraping is host-specific.
+  const html = readFileSync(join(dir, "..", "fixtures", "github-pr.html"), "utf8");
+  await page.route("https://github.com/**", (r) => r.fulfill({ contentType: "text/html", body: html }));
+  await page.goto("https://github.com/acme/widget/pull/7");
 
   // Inject the actual built content script; it stashes the result on a global.
   const code = readFileSync(join(distPath, "content.js"), "utf8");
@@ -63,19 +65,6 @@ test("bundled content script scrapes a GitHub PR DOM", async () => {
     branchHint: "feat/cool-thing",
   });
   expect((capture as { body: string }).body).toContain("cool thing");
-  await page.close();
-});
-
-test("bundled content script scrapes a Notion page DOM", async () => {
-  const page = await context.newPage();
-  await page.goto(`${FIXTURES}/notion.html`);
-  const code = readFileSync(join(distPath, "content.js"), "utf8");
-  const capture = await page.evaluate((src) => {
-    (0, eval)(src);
-    return (globalThis as Record<string, unknown>).__groveGrabResult;
-  }, code);
-  expect((capture as { title: string }).title).toBe("Improve the data API");
-  expect((capture as { body: string }).body).toContain("pagination");
   await page.close();
 });
 

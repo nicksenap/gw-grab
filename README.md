@@ -1,129 +1,92 @@
 # gw-grab
 
-> Paste a link, get a workspace. A [Grove](https://github.com/nicksenap/grove) plugin.
+> Collect a few links, dispatch an agent. A [Grove](https://github.com/nicksenap/grove) plugin + Chrome extension.
 
-`gw grab <url>` turns a **GitHub PR**, **GitLab MR**, **Notion page**, or **Slack
-message** URL into a ready-to-work Grove workspace — figuring out the repo, the
-branch, and a sensible name for you.
+You're reading a Slack thread and two Grafana panels and want a coding agent to
+look into it. Right-click each one → **Add to Grove dispatch**, type "try this
+out…" in the side panel, hit **Dispatch**. gw-grab then:
 
-```console
-$ gw grab https://github.com/funnel-io/conversational-analytics/pull/1172
+1. runs `gw create` with the preset or repo you picked,
+2. opens the workspace as a **background** [Herdr](https://herdr.dev) space (your focus doesn't move),
+3. starts the agent there (default `pi --no-skills --skill-profile pocock`) with a brief:
+   your instruction plus every captured link, title and selection.
 
-gw grab
-  Source : github #1172 — Surface data source status
-  Repo   : conversational-analytics
-  Branch : feat/data-source-status   [check out existing branch]
-  Name   : feat-data-source-status
+```text
+try this out
 
-Create this workspace? [Y]es / [e]dit / [n]o: y
+Context captured from the browser:
+
+1. Data chat is slow on stage
+   https://acme.slack.com/archives/C1/p1781511693141549
+   > p99 is 12s since 10:00
+
+2. Latency dashboard
+   https://grafana.acme.dev/d/abc
 ```
 
-For a **GitHub PR** it checks out the PR's *existing* head branch (so you land
-right on the code under review). For a **Notion task** or **Slack thread** —
-which carry no branch and often no repo hint — it derives a good branch name and
-infers the target repo.
-
-## How it works
-
-`gw-grab` only resolves *intent*; [Grove](https://github.com/nicksenap/grove)
-core does all the git/worktree/state work. The pipeline:
-
-1. **Parse** the URL into deterministic facts (owner/repo, PR number, page id,
-   channel + ts).
-2. **Resolve** live metadata: a PR's head branch + title via `gh` (GitLab via
-   `glab`); a Notion/Slack title via API token if you set one.
-3. **Fill the gaps** that have no single right answer — branch *naming* and repo
-   *inference* for Notion/Slack — with a small **local** model (see below).
-4. **Preview** the resolved `{repo, branch, name}` and let you accept or edit.
-5. Hand off to `gw create … --track --source-url …`.
-
-Ground-truth values (like a PR's real head branch) are **never** guessed by the
-model — only the genuinely fuzzy parts are.
-
-### It learns your routing
-
-Each grab remembers which repo a given **signal** (Slack channel, Notion
-workspace, GitHub owner) went to, in `$GROVE_DIR/grab-memory.json`. The next grab
-from the same channel/workspace pre-selects that repo **without** calling the
-model — so grab gets faster and more accurate the more you use it.
+Page content comes from your already-signed-in browser, so there are no API
+tokens to set up.
 
 ## Install
 
-```sh
-gw plugin install nicksenap/gw-grab
-```
-
-Requires the [Grove CLI](https://github.com/nicksenap/grove) (`gw`) ≥ v1.1.8.
-
-## Setup (this plugin needs a little more than most)
-
-Unlike most Grove plugins, `gw-grab` works best with a couple of extra pieces.
-**All of them are optional** — without them, grab still works, just with simpler
-heuristics (URL-slug branch names + the repo picker).
-
-### 1. A local model (recommended) — for smart naming & repo inference
-
-`gw-grab` talks to a local [Ollama](https://ollama.com) server. Everything stays
-on your machine — your Notion/Slack content never leaves it.
+Requires `gw` ≥ v1.1.8, `herdr`, and the [grove-herdr](https://github.com/nicksenap/grove-herdr)
+helper with `--no-focus` support. macOS or Linux, Chrome.
 
 ```sh
-# install Ollama (https://ollama.com/download), then pull a small model:
-ollama pull qwen2.5:3b      # default — best structured-output quality (~1.9 GB)
-# or, lighter / faster:
-ollama pull gemma3:1b       # ~815 MB
+# 1. The native host (also gives you `gw grab`)
+go build -o ~/.grove/plugins/gw-grab .
+
+# 2. The extension
+cd extension && pnpm install && pnpm build
+#    chrome://extensions → Developer mode → Load unpacked → extension/dist
+
+# 3. Let Chrome talk to the host (the id is fixed by the manifest key)
+gw grab install-host "$(cat extension/EXTENSION_ID)"
 ```
 
-If Ollama isn't running or the model isn't pulled, `gw-grab` prints a one-line
-note and falls back to deterministic heuristics — it never blocks.
+## Use
 
-| Model | Size | Notes |
-|-------|------|-------|
-| `qwen2.5:3b` *(default)* | 1.9 GB | Best instruction-following / repo inference at small size |
-| `gemma3:1b` | 815 MB | Lightest; great at naming, lighter on inference |
-| `llama3.2:3b` | 2.0 GB | Solid all-rounder, 128K context |
+| Action | How |
+|---|---|
+| Add a page | Right-click the page → **Add to Grove dispatch**, ⌘⇧G, or **+ Add this tab** in the panel |
+| Add a link (e.g. a Grafana URL in Slack) | Right-click the link → **Add to Grove dispatch** (the link itself is captured, not the page) |
+| Add a quote | Select text, right-click → **Add to Grove dispatch** |
+| Dispatch | Write the instruction, pick preset/repo and where the agent starts, **Dispatch** (⌘↵) |
 
-### 2. Tokens (optional) — for richer titles
+The panel remembers your last preset/repo, start directory, and agent command.
+A GitHub PR as the first capture preselects its repo and checks out the PR's
+existing branch. The list survives closing the panel and is cleared after a
+successful dispatch.
 
-- **`NOTION_TOKEN`** — fetch a Notion page's real title (otherwise the URL slug
-  is used, which is usually fine).
-- **`SLACK_TOKEN`** — fetch a Slack message's text for a descriptive branch name
-  (otherwise the name is generic, e.g. `slack-c0ft37yhz-1781511693`).
-
-### 3. CLIs (optional) — for PR/MR resolution
-
-- **`gh`** — resolve a GitHub PR's head branch + title. Without it, a PR URL
-  falls back to creating a new branch named `pr-<n>`.
-- **`glab`** — same, for GitLab MRs.
+Briefs are written to `~/.grove/grab/briefs/` (outside the worktree). If
+anything fails after the workspace is created, the workspace is kept and the
+panel says so; gw-grab never deletes anything.
 
 ## Configuration
 
-All via environment variables:
-
 | Variable | Default | Purpose |
-|----------|---------|---------|
-| `GW_GRAB_MODEL` | `qwen2.5:3b` | Ollama model to use |
-| `GW_GRAB_OLLAMA` | `http://localhost:11434` | Ollama endpoint |
-| `GW_GRAB_TIMEOUT_MS` | `4000` | Hard cap on a single inference before fallback |
-| `GW_GRAB_MIN_CONFIDENCE` | `0.55` | Min model confidence to auto-pick a repo |
-| `NOTION_TOKEN` | — | Notion integration token |
-| `SLACK_TOKEN` | — | Slack token (needs `channels:history`) |
+|---|---|---|
+| `GW_GRAB_AGENT_CMD` | `pi --no-skills --skill-profile pocock` | Agent started when the panel doesn't set one |
+| `GW_GRAB_HERDR_HELPER` | `~/.local/share/grove-herdr/hooks/herdr-workspace.sh` | grove-herdr helper path |
 
-## Supported URLs
+Chrome starts the host with a minimal `PATH`; the host adds `/opt/homebrew/bin`,
+`/usr/local/bin`, `~/go/bin` and `~/.local/bin` so `gw` and `herdr` resolve.
 
-| Source | Example | Branch behavior |
-|--------|---------|-----------------|
-| GitHub PR | `…/owner/repo/pull/123` | check out existing head |
-| GitHub branch | `…/owner/repo/tree/my-branch` | check out existing branch |
-| GitHub issue / repo | `…/owner/repo/issues/9` | new branch |
-| GitLab MR | `…/group/repo/-/merge_requests/12` | check out existing source branch |
-| Notion page | `…/Title-<32hexid>` | new branch (named from title) |
-| Slack message | `…/archives/<chan>/p<ts>` | new branch (named from thread) |
+## Without the browser
 
-## Non-interactive use
+```sh
+echo '{"name":"try-it","branch":"try-it","preset":"funnel-ai-full",
+       "startIn":"conversational-analytics","prompt":"try this out",
+       "items":[{"url":"https://grafana.acme.dev/d/abc","title":"Latency"}]}' \
+  | gw grab --dispatch
+```
 
-In a non-TTY (scripts/CI) `gw-grab` skips the prompt and proceeds with the
-resolved values, printing the plan to stderr. If no repo can be determined it
-exits non-zero rather than hanging.
+## Development
+
+```sh
+go test ./... && go vet ./...
+cd extension && pnpm typecheck && pnpm test && pnpm e2e
+```
 
 ## License
 

@@ -1,6 +1,6 @@
 // Package capture defines the payload the browser extension sends to the
 // gw-grab native-messaging host. The extension reads the already-authenticated,
-// already-rendered page (GitHub PR, Notion task, Slack thread, anything) and
+// already-rendered page (GitHub PR, Slack thread, Grafana, anything) and
 // hands over plain context — no API tokens, no provider SDKs on the host side.
 package capture
 
@@ -15,9 +15,8 @@ type Capture struct {
 	// Title is the page/issue/PR/task title as shown in the DOM.
 	Title string `json:"title"`
 
-	// Body is extracted page text (PR description, Notion page body, Slack
-	// thread) used as the strongest signal for repo inference. May be long; the
-	// resolver clips it.
+	// Body is extracted page text (PR description, Slack thread)
+	// included in the agent's brief. May be long; the brief clips it.
 	Body string `json:"body"`
 
 	// BranchHint is a branch name read directly off the page when the site shows

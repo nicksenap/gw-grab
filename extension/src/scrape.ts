@@ -48,14 +48,6 @@ function gitlab(doc: Document): SitePart {
   };
 }
 
-function notion(doc: Document): SitePart {
-  const title =
-    firstText(doc, [".notion-page-block .notranslate", 'div[placeholder="Untitled"]', "h1.notion-page-title"]) ||
-    text(doc.querySelector("title"));
-  const main = doc.querySelector(".notion-page-content") ?? doc.body;
-  return { title, body: text(main).slice(0, MAX_BODY) };
-}
-
 function slack(doc: Document): SitePart {
   const msg = firstText(doc, [".c-message_kit__blocks", ".p-rich_text_section", ".c-message__body"]);
   const channel = firstText(doc, [".p-view_header__channel_title", ".p-channel_sidebar__name--selected"]);
@@ -68,7 +60,6 @@ export function scrape(doc: Document, loc: Loc, selection = ""): Capture {
   let part: SitePart;
   if (host === "github.com") part = github(doc);
   else if (host.includes("gitlab")) part = gitlab(doc);
-  else if (host.endsWith("notion.so") || host.endsWith("notion.com")) part = notion(doc);
   else if (host.endsWith("slack.com")) part = slack(doc);
   else part = { title: text(doc.querySelector("title")) };
 

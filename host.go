@@ -6,24 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
-	"github.com/nicksenap/gw-grab/internal/resolver"
-	"github.com/nicksenap/gw-grab/internal/source"
 )
 
 // hostName is the native-messaging host id; the extension connects to it by this
 // exact name and Chrome looks up <name>.json in its NativeMessagingHosts dir.
 const hostName = "io.grove.gw_grab"
-
-// signalFor recomputes the memory signal (the stable signal→repo key) from a
-// proposal by re-parsing its source URL. Keeps memory keys consistent with what
-// the resolver used.
-func signalFor(p resolver.Proposal) string {
-	if sc, ok := source.ParseURL(p.SourceURL); ok {
-		return sc.Signal
-	}
-	return ""
-}
 
 // nativeHostManifest is Chrome's native-messaging host manifest schema.
 type nativeHostManifest struct {

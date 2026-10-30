@@ -1,13 +1,11 @@
 // Command gw-grab is a Grove plugin and Chrome native-messaging host. The
-// companion browser extension captures the page you're on (GitHub PR, Notion
-// task, Slack thread, anything) and sends it here; gw-grab resolves a repo +
-// branch + name and shells out to `gw create`. Grove core does all the
-// worktree/state work.
+// companion browser extension collects pages, links and selections (Slack,
+// Grafana, GitHub, anything) and sends them here; gw-grab creates a Grove
+// workspace, opens it as a background Herdr space and starts a coding agent
+// with the captures as its brief. Grove core does all the worktree/state work.
 //
 // Page context comes from the already-authenticated browser, so there are no API
-// tokens here. A local Ollama model (optional) names branches and infers the
-// repo for task-style sources; without it, deterministic heuristics + the side
-// panel's repo picker take over.
+// tokens here.
 //
 // Modes:
 //
@@ -19,7 +17,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,8 +28,6 @@ import (
 	"github.com/nicksenap/gw-grab/internal/dispatch"
 	"github.com/nicksenap/gw-grab/internal/grove"
 	"github.com/nicksenap/gw-grab/internal/herdr"
-	"github.com/nicksenap/gw-grab/internal/llm"
-	"github.com/nicksenap/gw-grab/internal/memory"
 	"github.com/nicksenap/gw-grab/internal/nativemsg"
 	"github.com/nicksenap/gw-grab/internal/resolver"
 )
@@ -74,19 +69,6 @@ func main() {
 		runHost()
 	default:
 		fail("unrecognized invocation; run `gw grab -h`")
-	}
-}
-
-// deps builds the resolver dependencies from config + live grove/git/LLM.
-func deps() resolver.Deps {
-	cfg := loadConfig()
-	repos, _ := grove.Repos()
-	return resolver.Deps{
-		Repos:          repos,
-		Memory:         memory.Load(memory.DefaultPath()),
-		LLM:            llm.New(cfg.ollamaEndpoint, cfg.model, cfg.timeout),
-		MinConfidence:  cfg.minConfidence,
-		BranchExamples: grove.BranchExamples,
 	}
 }
 
@@ -150,18 +132,17 @@ func handle(req hostRequest) hostResponse {
 			return hostResponse{Error: "gw preset list failed: " + err.Error()}
 		}
 		repos, _ := grove.Repos()
-		return hostResponse{OK: true, Presets: presets, Repos: repos, AgentCmd: loadConfig().agentCmd}
+		return hostResponse{OK: true, Presets: presets, Repos: repos, AgentCmd: agentCmd()}
 
 	case "resolve":
-		p := resolver.Resolve(context.Background(), req.Capture, deps())
+		repos, _ := grove.Repos()
+		p := resolver.Resolve(req.Capture, repos)
 		return hostResponse{OK: true, Proposal: &p}
 
 	case "create":
 		if err := create(req.Plan); err != nil {
 			return hostResponse{Error: err.Error()}
 		}
-		// Remember the (signal, repo) choice for next time.
-		recordMemory(req.Plan)
 		return hostResponse{OK: true}
 
 	default:
@@ -193,21 +174,12 @@ func create(p resolver.Proposal) error {
 	})
 }
 
-func recordMemory(p resolver.Proposal) {
-	// Only remember real local repos keyed by a provider signal we can recompute.
-	if p.Provider == "" || strings.HasPrefix(p.RepoName, "http") {
-		return
-	}
-	mem := memory.Load(memory.DefaultPath())
-	_ = mem.Record(p.Provider, signalFor(p), p.RepoName)
-}
-
 // runDispatch creates the workspace, opens it as a background Herdr space and
 // starts the agent with the brief. GROVE_HERDR_OPEN=0 stops the post_create hook
 // from opening a focused space; we open it ourselves with --no-focus.
 func runDispatch(j dispatch.Job, progress func(string)) hostResponse {
 	if strings.TrimSpace(j.AgentCmd) == "" {
-		j.AgentCmd = loadConfig().agentCmd
+		j.AgentCmd = agentCmd()
 	}
 	helper := herdr.DefaultHelper()
 	res, err := dispatch.Run(j, dispatch.Deps{
@@ -262,15 +234,12 @@ func runFromCapture(r io.Reader) error {
 	if err := json.Unmarshal(data, &cap); err != nil {
 		return fmt.Errorf("invalid capture JSON: %w", err)
 	}
-	p := resolver.Resolve(context.Background(), cap, deps())
+	repos, _ := grove.Repos()
+	p := resolver.Resolve(cap, repos)
 	// Print the resolved plan so it can be inspected, then create.
 	pretty, _ := json.MarshalIndent(p, "", "  ")
 	fmt.Fprintln(os.Stderr, string(pretty))
-	if err := create(p); err != nil {
-		return err
-	}
-	recordMemory(p)
-	return nil
+	return create(p)
 }
 
 func deriveName(branch string) string {
@@ -300,6 +269,6 @@ Other:
                              open background Herdr space, start the agent
   gw grab --version
 
-See the README for installing the extension and (optional) Ollama model.
+See the README for installing the extension.
 `)
 }
