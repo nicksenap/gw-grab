@@ -18,6 +18,7 @@ let context: BrowserContext;
 
 test.beforeAll(async () => {
   context = await chromium.launchPersistentContext("", {
+    channel: "chromium",
     headless: true,
     args: [
       `--headless=new`,
@@ -78,36 +79,37 @@ test("bundled content script scrapes a Notion page DOM", async () => {
   await page.close();
 });
 
-test("side panel renders a proposal and reflects edits", async () => {
+test("side panel lists captures and dispatches a job", async () => {
   const sw = await serviceWorker();
   const id = new URL(sw.url()).host;
   const page = await context.newPage();
 
-  // Stub chrome.runtime messaging BEFORE the panel script runs so it receives a
-  // proposal without a live native host.
+  // Stub chrome.* BEFORE the panel script runs so it works without a live host.
   await page.addInitScript(() => {
-    const proposal = {
-      provider: "github",
-      repo: "widget",
-      repoDisplay: "acme/widget",
-      branch: "feat/cool-thing",
-      name: "feat-cool-thing",
-      track: true,
-      sourceUrl: "https://github.com/acme/widget/pull/7",
-      sourceRef: "7",
-      sourceTitle: "Add cool thing",
-      candidates: ["acme/widget", "acme/api"],
-      notes: ["repo from memory of past grabs"],
+    const state = {
+      items: [
+        { url: "https://x.slack.com/archives/C1/p1", title: "Data chat slow", body: "", branchHint: "", selection: "p99 12s" },
+        { url: "https://grafana.example/d/abc", title: "Latency", body: "", branchHint: "", selection: "" },
+      ],
+      proposal: { name: "data-chat-slow", branch: "data-chat-slow", repo: "", track: false, sourceUrl: "https://x.slack.com/archives/C1/p1" },
+      status: "idle",
+      message: "",
     };
-    // @ts-expect-error test shim
-    window.chrome = {
+    const w = window as unknown as Record<string, unknown>;
+    w.__sent = [];
+    w.chrome = {
+      storage: { local: { get: () => Promise.resolve({}), set: () => Promise.resolve() } },
       runtime: {
         sendMessage: (msg: { type: string }) => {
-          if (msg.type === "grab:getState") {
-            return Promise.resolve({ state: "proposal", proposal, capture: {} });
-          }
-          if (msg.type === "grab:create") return Promise.resolve({ ok: true });
-          return Promise.resolve(undefined);
+          (w.__sent as unknown[]).push(msg);
+          if (msg.type === "grab:getState") return Promise.resolve(state);
+          if (msg.type === "grab:options")
+            return Promise.resolve({
+              presets: { "funnel-ai-full": ["saturn", "conversational-analytics"] },
+              repos: ["saturn", "conversational-analytics"],
+              agentCmd: "pi --no-skills --skill-profile pocock",
+            });
+          return Promise.resolve({ ok: true });
         },
         onMessage: { addListener: () => {} },
       },
@@ -116,16 +118,26 @@ test("side panel renders a proposal and reflects edits", async () => {
 
   await page.goto(`chrome-extension://${id}/sidepanel.html`);
 
-  await expect(page.locator("#sourceTitle")).toHaveText("Add cool thing");
-  await expect(page.locator("#branch")).toHaveValue("feat/cool-thing");
-  await expect(page.locator("#name")).toHaveValue("feat-cool-thing");
-  await expect(page.locator("#trackTag")).toBeVisible();
-  // Repo dropdown has both candidates.
-  await expect(page.locator("#repo option")).toHaveCount(2);
+  await expect(page.locator("#items li")).toHaveCount(2);
+  await expect(page.locator("#items li").first()).toContainText("p99 12s");
+  await expect(page.locator("#target")).toHaveValue("preset:funnel-ai-full");
+  await expect(page.locator("#name")).toHaveValue("data-chat-slow");
+  await expect(page.locator("#startIn option")).toHaveCount(3);
+  await expect(page.locator("#agentCmd")).toHaveValue("pi --no-skills --skill-profile pocock");
 
-  // Edit the branch, click create, see the success message (host stubbed ok).
-  await page.fill("#branch", "fix/edited");
-  await page.click("#create");
-  await expect(page.locator("#result")).toContainText("Workspace created");
+  await page.selectOption("#startIn", "conversational-analytics");
+  await page.fill("#prompt", "try this out");
+  await page.press("#prompt", "Meta+Enter");
+
+  const job = await page.waitForFunction(() =>
+    ((window as unknown as { __sent: Array<{ type: string; job?: unknown }> }).__sent).find((m) => m.type === "grab:dispatch")?.job,
+  );
+  expect(await job.jsonValue()).toMatchObject({
+    name: "data-chat-slow",
+    preset: "funnel-ai-full",
+    startIn: "conversational-analytics",
+    prompt: "try this out",
+    agentCmd: "pi --no-skills --skill-profile pocock",
+  });
   await page.close();
 });

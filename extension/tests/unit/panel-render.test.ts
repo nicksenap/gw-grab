@@ -1,22 +1,30 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { JSDOM } from "jsdom";
-import { els, populateRepos, readProposal, render, setResult, type PanelEls } from "../../src/panel-render.js";
-import type { Proposal } from "../../src/types.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  buildJob,
+  defaultTarget,
+  els,
+  parseTarget,
+  render,
+  renderStartIn,
+  renderTargets,
+  reposFor,
+  slugName,
+  suggestName,
+  type PanelEls,
+} from "../../src/panel-render.js";
+import type { DispatchState, Options, Proposal } from "../../src/types.js";
 
-// Minimal DOM matching public/sidepanel.html ids.
-const HTML = `
-  <div id="empty"></div>
-  <div id="capturing" class="hidden"></div>
-  <form id="plan" class="hidden">
-    <span id="provider"></span><span id="sourceTitle"></span>
-    <div id="sourceUrl"></div>
-    <select id="repo"></select>
-    <input id="branch" /><span id="trackTag" class="hidden"></span>
-    <input id="name" />
-    <ul id="notes"></ul>
-    <button id="create"></button>
-    <div id="result"></div>
-  </form>`;
+// Use the real panel HTML so id drift between html and code fails here.
+const HTML = readFileSync(join(__dirname, "../../public/sidepanel.html"), "utf8");
+
+const opts: Options = {
+  presets: { "funnel-ai-full": ["saturn", "conversational-analytics"], "a-preset": ["api"] },
+  repos: ["saturn", "conversational-analytics", "widget"],
+  agentCmd: "pi --no-skills --skill-profile pocock",
+};
 
 function proposal(over: Partial<Proposal> = {}): Proposal {
   return {
@@ -29,105 +37,158 @@ function proposal(over: Partial<Proposal> = {}): Proposal {
     sourceUrl: "https://github.com/acme/widget/pull/7",
     sourceRef: "7",
     sourceTitle: "Add cool thing",
-    candidates: ["acme/widget", "acme/api"],
-    notes: ["repo from memory of past grabs"],
+    candidates: [],
+    notes: [],
     ...over,
   };
 }
 
-let d: Document;
+function state(over: Partial<DispatchState> = {}): DispatchState {
+  return { items: [], proposal: null, status: "idle", message: "", ...over };
+}
+
+const slack = { url: "https://x.slack.com/archives/C1/p1", title: "Data chat slow", body: "", branchHint: "", selection: "p99 12s" };
+
 let e: PanelEls;
 beforeEach(() => {
-  d = new JSDOM(HTML).window.document;
-  e = els(d);
+  e = els(new JSDOM(HTML).window.document);
 });
 
-describe("populateRepos", () => {
-  it("lists candidates and selects the chosen one", () => {
-    populateRepos(e.repo, ["a", "b", "c"], "b");
-    expect(e.repo.value).toBe("b");
-    expect(e.repo.options.length).toBe(3);
+describe("targets", () => {
+  it("parses preset/repo values and rejects junk", () => {
+    expect(parseTarget("preset:funnel-ai-full")).toEqual({ kind: "preset", name: "funnel-ai-full" });
+    expect(parseTarget("repo:widget")).toEqual({ kind: "repo", name: "widget" });
+    expect(parseTarget("x:y")).toBeNull();
+    expect(parseTarget("repo:")).toBeNull();
+    expect(parseTarget("")).toBeNull();
   });
 
-  it("prepends a selected value not in candidates (clone URL)", () => {
-    populateRepos(e.repo, ["a"], "https://github.com/x/y.git");
-    expect(e.repo.options.length).toBe(2);
-    expect(e.repo.value).toBe("https://github.com/x/y.git");
+  it("lists repos for a target", () => {
+    expect(reposFor(parseTarget("preset:funnel-ai-full"), opts)).toEqual(["saturn", "conversational-analytics"]);
+    expect(reposFor(parseTarget("repo:widget"), opts)).toEqual(["widget"]);
+    expect(reposFor(parseTarget("preset:missing"), opts)).toEqual([]);
+    expect(reposFor(null, opts)).toEqual([]);
   });
 
-  it("shows a placeholder when there are no repos", () => {
-    populateRepos(e.repo, [], "");
-    expect(e.repo.options.length).toBe(1);
-    expect(e.repo.options[0].textContent).toContain("no repos");
+  it("defaults: resolved repo > last used > first preset > first repo", () => {
+    expect(defaultTarget(opts, proposal(), "preset:funnel-ai-full")).toBe("repo:widget");
+    expect(defaultTarget(opts, null, "preset:funnel-ai-full")).toBe("preset:funnel-ai-full");
+    expect(defaultTarget(opts, null, "preset:gone")).toBe("preset:a-preset");
+    expect(defaultTarget({ ...opts, presets: {} }, null, "")).toBe("repo:saturn");
+    expect(defaultTarget({ presets: {}, repos: [], agentCmd: "" }, null, "")).toBe("");
+  });
+
+  it("renders grouped targets with the selection", () => {
+    renderTargets(e, opts, "preset:funnel-ai-full");
+    expect(e.target.querySelectorAll("optgroup").length).toBe(2);
+    expect(e.target.value).toBe("preset:funnel-ai-full");
+  });
+
+  it("start-in offers root + repos, keeps last, picks the only repo", () => {
+    renderStartIn(e, ["saturn", "conversational-analytics"], "conversational-analytics");
+    expect([...e.startIn.options].map((o) => o.value)).toEqual(["", "saturn", "conversational-analytics"]);
+    expect(e.startIn.value).toBe("conversational-analytics");
+    renderStartIn(e, ["saturn", "conversational-analytics"], "gone");
+    expect(e.startIn.value).toBe("");
+    renderStartIn(e, ["widget"], "");
+    expect(e.startIn.value).toBe("widget");
   });
 });
 
 describe("render", () => {
-  it("shows the plan form for a proposal and fills fields", () => {
-    render(e, { state: "proposal", proposal: proposal(), capture: {} as never });
-    expect(e.plan.classList.contains("hidden")).toBe(false);
-    expect(e.branch.value).toBe("feat/cool-thing");
-    expect(e.name.value).toBe("feat-cool-thing");
-    expect(e.provider.textContent).toBe("github");
-    expect(e.trackTag.classList.contains("hidden")).toBe(false); // track on
-    expect(e.notes.querySelectorAll("li").length).toBe(1);
-  });
-
-  it("hides the track tag when not tracking", () => {
-    render(e, { state: "proposal", proposal: proposal({ track: false }), capture: {} as never });
-    expect(e.trackTag.classList.contains("hidden")).toBe(true);
-  });
-
-  it("shows capturing state", () => {
-    render(e, { state: "capturing" });
-    expect(e.capturing.classList.contains("hidden")).toBe(false);
-    expect(e.plan.classList.contains("hidden")).toBe(true);
-  });
-
-  it("renders an error into the empty slot", () => {
-    render(e, { state: "error", error: "host down" });
-    expect(e.empty.textContent).toBe("host down");
-    expect(e.empty.className).toContain("error");
-  });
-
-  it("idle shows the empty hint", () => {
-    render(e, { state: "idle" });
+  it("shows empty hint with no items", () => {
+    render(e, state());
     expect(e.empty.classList.contains("hidden")).toBe(false);
+    expect(e.clear.disabled).toBe(true);
   });
 
-  it("handles a null notes array", () => {
-    render(e, { state: "proposal", proposal: proposal({ notes: null }), capture: {} as never });
-    expect(e.notes.querySelectorAll("li").length).toBe(0);
+  it("lists items with selection and remove buttons", () => {
+    render(e, state({ items: [slack, { ...slack, url: "https://grafana/d/1", title: "", selection: "" }] }));
+    const lis = e.items.querySelectorAll("li");
+    expect(lis.length).toBe(2);
+    expect(lis[0].querySelector(".t")?.textContent).toBe("Data chat slow");
+    expect(lis[0].querySelector(".s")?.textContent).toContain("p99 12s");
+    expect(lis[1].querySelector(".t")?.textContent).toBe("https://grafana/d/1");
+    expect((lis[1].querySelector(".x") as HTMLElement).dataset.index).toBe("1");
+    expect(e.empty.classList.contains("hidden")).toBe(true);
   });
-});
 
-describe("readProposal", () => {
-  it("reflects edited fields back into the proposal", () => {
-    render(e, { state: "proposal", proposal: proposal(), capture: {} as never });
-    e.repo.value = "acme/api";
-    e.branch.value = "  fix/bug  ";
-    e.name.value = "  fix-bug  ";
-    const p = readProposal(e, proposal());
-    expect(p.repo).toBe("acme/api");
-    expect(p.branch).toBe("fix/bug");
-    expect(p.name).toBe("fix-bug");
-    expect(p.sourceUrl).toBe("https://github.com/acme/widget/pull/7"); // base preserved
-  });
-});
-
-describe("setResult", () => {
-  it("sets ok and error styling", () => {
-    setResult(e, true, "done");
-    expect(e.result.className).toContain("ok");
-    setResult(e, false, "nope");
-    expect(e.result.className).toContain("error");
-    expect(e.result.textContent).toBe("nope");
+  it("reflects dispatching / error / done", () => {
+    render(e, state({ status: "dispatching", message: "Opening Herdr space…" }));
+    expect(e.dispatch.disabled).toBe(true);
+    expect(e.status.textContent).toBe("Opening Herdr space…");
+    render(e, state({ status: "error", message: "boom" }));
+    expect(e.status.className).toContain("error");
+    expect(e.dispatch.disabled).toBe(false);
+    render(e, state({ status: "done", message: "ok" }));
+    expect(e.status.className).toContain("ok");
   });
 });
 
-describe("els", () => {
-  it("throws on a missing element", () => {
-    const bare = new JSDOM("<div></div>").window.document;
-    expect(() => els(bare)).toThrow(/missing #/);
+describe("names", () => {
+  it("slugs to a host-valid name", () => {
+    expect(slugName("  Try this out: Grafana p99!! ")).toBe("try-this-out-grafana-p99");
+    expect(slugName("feat/cool-thing")).toBe("feat-cool-thing");
+    expect(slugName("--x--")).toBe("x");
+    expect(slugName("a".repeat(80)).length).toBe(50);
+  });
+
+  it("suggests from proposal, else first words of the prompt", () => {
+    expect(suggestName(proposal(), "whatever")).toBe("feat-cool-thing");
+    expect(suggestName(null, "try this out on stage please now ok")).toBe("try-this-out-on-stage-please");
+  });
+});
+
+describe("buildJob", () => {
+  function fill(target: string, name: string, prompt: string, startIn = "") {
+    renderTargets(e, opts, target);
+    renderStartIn(e, reposFor(parseTarget(target), opts), startIn);
+    e.name.value = name;
+    e.prompt.value = prompt;
+  }
+
+  it("builds a preset job with captures", () => {
+    fill("preset:funnel-ai-full", "Try It", "try this out", "conversational-analytics");
+    const job = buildJob(e, state({ items: [slack] }), opts);
+    expect(job).toEqual({
+      name: "try-it",
+      branch: "try-it",
+      track: false,
+      preset: "funnel-ai-full",
+      repos: [],
+      startIn: "conversational-analytics",
+      agentCmd: opts.agentCmd,
+      prompt: "try this out",
+      items: [slack],
+    });
+  });
+
+  it("tracks the PR branch only when targeting that repo", () => {
+    fill("repo:widget", "review-it", "review");
+    const s = state({ items: [slack], proposal: proposal() });
+    const job = buildJob(e, s, opts);
+    expect(job).toMatchObject({ track: true, branch: "feat/cool-thing", name: "review-it", repos: ["widget"] });
+    fill("preset:funnel-ai-full", "review-it", "review");
+    expect(buildJob(e, s, opts)).toMatchObject({ track: false, branch: "review-it" });
+  });
+
+  it("uses the custom agent command when set", () => {
+    fill("repo:widget", "x", "go");
+    e.agentCmd.value = " claude ";
+    expect(buildJob(e, state(), opts)).toMatchObject({ agentCmd: "claude" });
+  });
+
+  it("falls back to a suggested name", () => {
+    fill("repo:widget", "", "fix the flaky test");
+    expect(buildJob(e, state(), opts)).toMatchObject({ name: "fix-the-flaky-test" });
+  });
+
+  it("returns errors for missing target, name, or content", () => {
+    fill("repo:widget", "x", "");
+    expect(buildJob(e, state(), opts)).toBe("Add a capture or write an instruction.");
+    e.target.innerHTML = "";
+    expect(buildJob(e, state(), opts)).toBe("Pick a preset or repo.");
+    fill("repo:widget", "!!!", "");
+    expect(buildJob(e, state({ items: [slack] }), opts)).toBe("Give the workspace a name.");
   });
 });

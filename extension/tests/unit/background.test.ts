@@ -78,6 +78,26 @@ describe("sendNative", () => {
     expect(resp.error).toContain("install-host");
   });
 
+  it("streams progress messages and resolves on the final reply", async () => {
+    const { sendNative } = await importBg();
+    const seen: string[] = [];
+    const p = sendNative({ action: "options" }, (m) => seen.push(m));
+    port._emit({ progress: "Creating workspace…" });
+    port._emit({ progress: "Opening Herdr space…" });
+    port._emit({ ok: true, result: { workspace: "w", path: "/w", herdr: "wX", pane: "wX:p1", brief: "/b" } });
+    const resp = await p;
+    expect(seen).toEqual(["Creating workspace…", "Opening Herdr space…"]);
+    expect(resp.result?.pane).toBe("wX:p1");
+    expect(port.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats an error message as final even if it has progress", async () => {
+    const { sendNative } = await importBg();
+    const p = sendNative({ action: "options" }, () => {});
+    port._emit({ progress: "x", error: "gw create failed" });
+    expect((await p).error).toBe("gw create failed");
+  });
+
   it("handles connectNative throwing", async () => {
     (globalThis as Record<string, unknown>).chrome = {
       runtime: {

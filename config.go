@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/nicksenap/gw-grab/internal/dispatch"
 	"github.com/nicksenap/gw-grab/internal/llm"
 )
 
@@ -20,6 +21,7 @@ type config struct {
 	ollamaEndpoint string
 	timeout        time.Duration
 	minConfidence  float64
+	agentCmd       string
 }
 
 func loadConfig() config {
@@ -28,6 +30,7 @@ func loadConfig() config {
 		ollamaEndpoint: getenv("GW_GRAB_OLLAMA", llm.DefaultEndpoint),
 		timeout:        llm.DefaultTimeout,
 		minConfidence:  0.55,
+		agentCmd:       getenv("GW_GRAB_AGENT_CMD", dispatch.DefaultAgentCmd),
 	}
 	if v := os.Getenv("GW_GRAB_TIMEOUT_MS"); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {

@@ -1,15 +1,26 @@
-// background.ts — service worker. Owns the triggers (context menu, toolbar icon,
-// keyboard command), scrapes the active tab, brokers messages with the native
-// host, and broadcasts state to the side panel.
-import type { Capture, GrabState, HostRequest, HostResponse, Proposal } from "./types.js";
+// background.ts — service worker. Owns the triggers (context menu, keyboard
+// command, panel buttons), collects captures into a dispatch list, brokers
+// messages with the native host, and broadcasts state to the side panel.
+import type { Capture, DispatchState, HostRequest, HostResponse, Job, Options } from "./types.js";
 
 export const HOST = "io.grove.gw_grab";
+const STORE_KEY = "dispatchState";
 
-let lastState: GrabState = { state: "idle" };
+export function emptyState(): DispatchState {
+  return { items: [], proposal: null, status: "idle", message: "" };
+}
+
+let state: DispatchState = emptyState();
+let loaded: Promise<void> | null = null;
 
 // --- native messaging (isolated so it can be unit-tested with a fake chrome) ---
 
-export function sendNative(message: HostRequest): Promise<HostResponse> {
+/**
+ * sendNative opens a port, posts one request and resolves with the first
+ * non-progress reply. `{progress}` messages (streamed by long actions such as
+ * dispatch) are passed to onProgress.
+ */
+export function sendNative(message: HostRequest, onProgress?: (msg: string) => void): Promise<HostResponse> {
   return new Promise((resolve) => {
     let port: chrome.runtime.Port;
     try {
@@ -20,6 +31,10 @@ export function sendNative(message: HostRequest): Promise<HostResponse> {
     }
     let done = false;
     port.onMessage.addListener((msg: HostResponse) => {
+      if (msg?.progress && !msg.ok && !msg.error) {
+        onProgress?.(msg.progress);
+        return;
+      }
       done = true;
       resolve(msg);
       port.disconnect();
@@ -36,46 +51,115 @@ export function sendNative(message: HostRequest): Promise<HostResponse> {
   });
 }
 
-function broadcast(): void {
-  void chrome.runtime.sendMessage({ type: "grab:update", payload: lastState }).catch(() => {});
+// --- state (persisted to storage.session so a worker restart keeps the list) ---
+
+async function load(): Promise<void> {
+  loaded ??= (async () => {
+    try {
+      const got = await chrome.storage?.session?.get(STORE_KEY);
+      const saved = got?.[STORE_KEY] as DispatchState | undefined;
+      if (saved?.items) state = { ...saved, status: saved.status === "dispatching" ? "idle" : saved.status };
+    } catch {
+      // storage unavailable (tests) — keep in-memory state
+    }
+  })();
+  return loaded;
 }
 
-function setState(s: GrabState): void {
-  lastState = s;
-  broadcast();
+export function getState(): DispatchState {
+  return state;
 }
 
-// --- capture + resolve ---
+function setState(next: Partial<DispatchState>): void {
+  state = { ...state, ...next };
+  void chrome.storage?.session?.set({ [STORE_KEY]: state }).catch(() => {});
+  void chrome.runtime.sendMessage({ type: "grab:update", payload: state }).catch(() => {});
+}
 
-export async function grab(tab: chrome.tabs.Tab): Promise<void> {
+// --- capture ---
+
+/** captureFromClick builds a Capture for a right-clicked link without scraping. */
+export function captureFromLink(linkUrl: string, linkText = ""): Capture {
+  return { url: linkUrl, title: linkText.trim() || linkUrl, body: "", branchHint: "", selection: "" };
+}
+
+async function scrapeTab(tabId: number): Promise<Capture> {
+  const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  if (!result) throw new Error("empty capture");
+  return result as Capture;
+}
+
+function openPanel(tab?: chrome.tabs.Tab): void {
+  // Must run synchronously inside the user gesture, before any await.
+  if (tab?.windowId !== undefined) {
+    chrome.sidePanel?.open({ windowId: tab.windowId }).catch(() => {});
+  }
+}
+
+/** addCapture appends a capture; the first one is resolved to prefill the form. */
+export async function addCapture(c: Capture): Promise<void> {
+  await load();
+  const items = [...state.items, c];
+  setState({ items, status: "idle", message: "", result: undefined });
+  if (items.length === 1 || !state.proposal) {
+    const resp = await sendNative({ action: "resolve", capture: c });
+    if (resp?.proposal) setState({ proposal: resp.proposal });
+  }
+}
+
+/** addTab scrapes a tab and adds it to the list. */
+export async function addTab(tab: chrome.tabs.Tab): Promise<void> {
   if (!tab?.id) return;
-  const tabId = tab.id;
+  await load();
+  setState({ status: "capturing", message: "Reading the page…" });
+  let c: Capture;
   try {
-    await chrome.sidePanel.open({ tabId });
-  } catch {
-    // Programmatic open can be disallowed; the user can open the panel manually.
-  }
-  setState({ state: "capturing" });
-
-  let capture: Capture;
-  try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
-    });
-    if (!result) throw new Error("empty capture");
-    capture = result as Capture;
+    c = await scrapeTab(tab.id);
   } catch (e) {
-    setState({ state: "error", error: "Could not read the page: " + (e as Error).message });
+    setState({ status: "error", message: "Could not read the page: " + (e as Error).message });
     return;
   }
+  await addCapture(c);
+}
 
-  const resp = await sendNative({ action: "resolve", capture });
-  if (!resp || resp.error || !resp.proposal) {
-    setState({ state: "error", error: resp?.error ?? "no proposal from host", capture });
-    return;
+export async function removeItem(index: number): Promise<void> {
+  await load();
+  const items = state.items.filter((_, i) => i !== index);
+  setState({ items, proposal: items.length ? state.proposal : null });
+}
+
+export async function clear(): Promise<void> {
+  await load();
+  setState(emptyState());
+}
+
+// --- options + dispatch ---
+
+let optionsCache: Options | null = null;
+
+export async function options(): Promise<Options | { error: string }> {
+  if (optionsCache) return optionsCache;
+  const resp = await sendNative({ action: "options" });
+  if (!resp?.ok) return { error: resp?.error ?? "no options from host" };
+  optionsCache = {
+    presets: resp.presets ?? {},
+    repos: (resp.repos ?? []).map((r) => r.name),
+    agentCmd: resp.agentCmd ?? "",
+  };
+  return optionsCache;
+}
+
+export async function dispatch(job: Job): Promise<HostResponse> {
+  await load();
+  setState({ status: "dispatching", message: "Sending to host…", result: undefined });
+  const resp = await sendNative({ action: "dispatch", job }, (m) => setState({ message: m }));
+  if (resp?.ok && resp.result) {
+    const r = resp.result;
+    setState({ ...emptyState(), status: "done", message: `Dispatched → ${r.workspace} (Herdr ${r.pane})`, result: r });
+  } else {
+    setState({ status: "error", message: resp?.error ?? "dispatch failed" });
   }
-  setState({ state: "proposal", proposal: resp.proposal, capture });
+  return resp;
 }
 
 // --- wiring (skipped under test where `chrome` lacks these APIs) ---
@@ -83,35 +167,49 @@ export async function grab(tab: chrome.tabs.Tab): Promise<void> {
 export function registerTriggers(): void {
   chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({
-      id: "grab",
-      title: "Grab into Grove workspace",
+      id: "add",
+      title: "Add to Grove dispatch",
       contexts: ["page", "selection", "link"],
     });
     chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   });
 
   chrome.contextMenus.onClicked.addListener((info, tab) => {
-    if (info.menuItemId === "grab" && tab) void grab(tab);
+    if (info.menuItemId !== "add") return;
+    openPanel(tab);
+    if (info.linkUrl) void addCapture(captureFromLink(info.linkUrl, info.selectionText));
+    else if (tab) void addTab(tab);
   });
 
-  chrome.action.onClicked.addListener((tab) => void grab(tab));
-
-  chrome.commands.onCommand.addListener((cmd) => {
-    if (cmd === "grab") {
-      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-        if (tab) void grab(tab);
-      });
-    }
+  chrome.commands.onCommand.addListener((cmd, tab) => {
+    if (cmd !== "grab") return;
+    openPanel(tab);
+    if (tab) void addTab(tab);
+    else chrome.tabs.query({ active: true, currentWindow: true }, ([t]) => t && void addTab(t));
   });
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg?.type === "grab:getState") {
-      sendResponse(lastState);
-      return false;
-    }
-    if (msg?.type === "grab:create") {
-      sendNative({ action: "create", plan: msg.plan as Proposal }).then(sendResponse);
+    const reply = (p: Promise<unknown>) => {
+      p.then(sendResponse);
       return true; // async
+    };
+    switch (msg?.type) {
+      case "grab:getState":
+        return reply(load().then(getState));
+      case "grab:addActive":
+        return reply(
+          new Promise<void>((res) =>
+            chrome.tabs.query({ active: true, lastFocusedWindow: true }, ([t]) => res(t ? addTab(t) : undefined)),
+          ),
+        );
+      case "grab:remove":
+        return reply(removeItem(msg.index as number));
+      case "grab:clear":
+        return reply(clear());
+      case "grab:options":
+        return reply(options());
+      case "grab:dispatch":
+        return reply(dispatch(msg.job as Job));
     }
     return false;
   });

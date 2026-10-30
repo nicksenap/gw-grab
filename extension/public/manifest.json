@@ -1,17 +1,21 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAstVFFWv66rdRnnWX+sdDFsqYxfYIumhqsGF+Z+le7PX5tCGeVp4c/HSRGHca1Ckx2lcgJ5iOO+F2Xz8zl6dEizTNA3b+sewpYp3Fb3d+8y/qHJuLRdvXjV6qle1q5VGj4E1KQezuvhVCrw5TrUasJZQFDPS6elr5IcEkMlHekya8Bs2+FRrlHI76GThhzWTHAAxEAX3UrqjMDlCa1fXfashcM24bXCUECYzbw+lQg22YpHxKQLcWXzcGt1nryC/XOFx8xzSDxMhTDVG/iS78A7JXLcmLIJKXU/9B1evJRZdgisLjm2ONF1z40ilj3KYvhUS6bxooT6K9+RIWHh/HzwIDAQAB",
   "name": "Grove Grab",
   "version": "0.1.0",
-  "description": "Grab the page you're on into a Grove worktree workspace.",
+  "description": "Collect pages, links and selections, then dispatch them to a coding agent in a fresh Grove workspace.",
   "minimum_chrome_version": "114",
   "permissions": [
     "contextMenus",
     "activeTab",
     "scripting",
     "sidePanel",
-    "nativeMessaging"
+    "nativeMessaging",
+    "storage"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -20,7 +24,7 @@
     "default_path": "sidepanel.html"
   },
   "action": {
-    "default_title": "Grab into Grove",
+    "default_title": "Grove dispatch",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
@@ -34,8 +38,11 @@
   },
   "commands": {
     "grab": {
-      "suggested_key": { "default": "Ctrl+Shift+G", "mac": "Command+Shift+G" },
-      "description": "Grab the current page into a Grove workspace"
+      "suggested_key": {
+        "default": "Ctrl+Shift+G",
+        "mac": "Command+Shift+G"
+      },
+      "description": "Add the current page to the Grove dispatch list"
     }
   }
 }
