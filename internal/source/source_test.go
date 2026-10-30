@@ -27,9 +27,6 @@ func TestParseURL_GitHubPR(t *testing.T) {
 	if sc.BranchMode != BranchModeTrack {
 		t.Errorf("branch mode = %q, want track", sc.BranchMode)
 	}
-	if sc.Signal != "funnel-io" {
-		t.Errorf("signal = %q, want funnel-io", sc.Signal)
-	}
 }
 
 func TestParseURL_GitHubTree(t *testing.T) {
@@ -69,25 +66,6 @@ func TestParseURL_GitLabMR(t *testing.T) {
 	}
 }
 
-func TestParseURL_Notion(t *testing.T) {
-	sc, ok := ParseURL("https://app.notion.com/p/funnelio/The-agent-cannot-see-and-surface-the-status-of-the-Data-Sources-37430a04501f8008b6e9c63e43d9a698?source=copy_link")
-	if !ok {
-		t.Fatal("expected ok")
-	}
-	if sc.Provider != ProviderNotion {
-		t.Errorf("provider = %q", sc.Provider)
-	}
-	if sc.Ref != "37430a04501f8008b6e9c63e43d9a698" {
-		t.Errorf("page id = %q", sc.Ref)
-	}
-	if sc.Title != "The agent cannot see and surface the status of the Data Sources" {
-		t.Errorf("title = %q", sc.Title)
-	}
-	if sc.BranchMode != BranchModeCreate {
-		t.Errorf("mode = %q, want create", sc.BranchMode)
-	}
-}
-
 func TestParseURL_Slack(t *testing.T) {
 	sc, ok := ParseURL("https://qwaya.slack.com/archives/C0FT37YHZ/p1781511693141549")
 	if !ok {
@@ -95,9 +73,6 @@ func TestParseURL_Slack(t *testing.T) {
 	}
 	if sc.Provider != ProviderSlack {
 		t.Errorf("provider = %q", sc.Provider)
-	}
-	if sc.Signal != "C0FT37YHZ" {
-		t.Errorf("channel = %q", sc.Signal)
 	}
 	if sc.Ref != "1781511693.141549" {
 		t.Errorf("ts = %q", sc.Ref)

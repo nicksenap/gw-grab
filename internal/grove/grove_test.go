@@ -1,6 +1,9 @@
 package grove
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func sampleRepos() []Repo {
 	return []Repo{
@@ -45,5 +48,38 @@ func TestNames(t *testing.T) {
 		if names[i] != want[i] {
 			t.Errorf("names[%d] = %q, want %q", i, names[i], want[i])
 		}
+	}
+}
+
+func TestCreateArgs_PresetWinsOverRepo(t *testing.T) {
+	got := strings.Join(CreateArgs(CreateOpts{Name: "n", Branch: "b", Repo: "api", Preset: "funnel-ai-full", SourceURL: "https://x"}), " ")
+	want := "create n --branch b --preset funnel-ai-full --source-url https://x"
+	if got != want {
+		t.Errorf("got %q\nwant %q", got, want)
+	}
+}
+
+func TestCreateArgs_Repo(t *testing.T) {
+	got := strings.Join(CreateArgs(CreateOpts{Name: "n", Branch: "b", Repo: "api", Track: true}), " ")
+	if got != "create n --branch b --repos api --track" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestParsePresets(t *testing.T) {
+	p, err := ParsePresets([]byte(`{"funnel-ai-full":{"repos":["saturn","conversational-analytics"]}}`))
+	if err != nil || len(p["funnel-ai-full"]) != 2 || p["funnel-ai-full"][0] != "saturn" {
+		t.Fatalf("got %v, %v", p, err)
+	}
+}
+
+func TestParseWorkspace(t *testing.T) {
+	data := []byte(`[{"name":"a","path":"/w/a","repos":[{"repo_name":"saturn","worktree_path":"/w/a/saturn"}]},{"name":"b","path":"/w/b"}]`)
+	ws, err := ParseWorkspace(data, "a")
+	if err != nil || ws.Path != "/w/a" || ws.Repos[0].WorktreePath != "/w/a/saturn" {
+		t.Fatalf("got %+v, %v", ws, err)
+	}
+	if _, err := ParseWorkspace(data, "zzz"); err == nil {
+		t.Error("expected not-found error")
 	}
 }

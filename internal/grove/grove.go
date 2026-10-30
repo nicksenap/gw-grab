@@ -4,7 +4,10 @@
 package grove
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -55,7 +58,7 @@ func MatchRepoSlug(repos []Repo, slug string) (string, bool) {
 }
 
 // Names returns the display names (owner/repo where known, else folder name) of
-// the given repos — the candidate list handed to the model.
+// the given repos — the candidate list for the side panel.
 func Names(repos []Repo) []string {
 	out := make([]string, len(repos))
 	for i, r := range repos {
@@ -68,39 +71,12 @@ func Names(repos []Repo) []string {
 	return out
 }
 
-// BranchExamples returns up to n recent branch names from a repo's local path,
-// used as few-shot so generated names match the team's convention.
-func BranchExamples(repoPath string, n int) []string {
-	if repoPath == "" {
-		return nil
-	}
-	cmd := exec.Command("git", "-C", repoPath, "for-each-ref",
-		"--sort=-committerdate", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	var branches []string
-	seen := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		b := strings.TrimPrefix(strings.TrimSpace(line), "origin/")
-		if b == "" || b == "HEAD" || seen[b] {
-			continue
-		}
-		seen[b] = true
-		branches = append(branches, b)
-		if len(branches) >= n {
-			break
-		}
-	}
-	return branches
-}
-
 // CreateOpts are the inputs for `gw create`.
 type CreateOpts struct {
 	Name           string
 	Branch         string
-	Repo           string // local repo name, or a clone URL for clone-on-miss
+	Repo           string // local repo name(s, comma-separated), or a clone URL for clone-on-miss
+	Preset         string // Grove preset; takes precedence over Repo
 	Track          bool
 	SourceURL      string
 	SourceProvider string
@@ -108,10 +84,14 @@ type CreateOpts struct {
 	SourceTitle    string
 }
 
-// Create invokes `gw create` with the resolved options, streaming its output to
-// the user's terminal. gw owns all workspace/worktree/state work.
-func Create(o CreateOpts) error {
-	args := []string{"create", o.Name, "--repos", o.Repo, "--branch", o.Branch}
+// CreateArgs builds the `gw create` argv (without the leading "gw").
+func CreateArgs(o CreateOpts) []string {
+	args := []string{"create", o.Name, "--branch", o.Branch}
+	if o.Preset != "" {
+		args = append(args, "--preset", o.Preset)
+	} else {
+		args = append(args, "--repos", o.Repo)
+	}
 	if o.Track {
 		args = append(args, "--track")
 	}
@@ -127,9 +107,92 @@ func Create(o CreateOpts) error {
 	if o.SourceTitle != "" {
 		args = append(args, "--source-title", o.SourceTitle)
 	}
-	cmd := exec.Command("gw", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	return cmd.Run()
+	return args
+}
+
+// Create invokes `gw create`. gw owns all workspace/worktree/state work.
+//
+// In native-host mode stdout is Chrome's message stream and stdin is Chrome's
+// request stream, so gw must never inherit either: its output goes to stderr
+// (Chrome's log) and is also returned in the error on failure. extraEnv is
+// appended to the environment (e.g. GROVE_HERDR_OPEN=0).
+func Create(o CreateOpts, extraEnv ...string) error {
+	var buf bytes.Buffer
+	cmd := exec.Command("gw", CreateArgs(o)...)
+	cmd.Stdin = nil
+	cmd.Stdout = io.MultiWriter(os.Stderr, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	cmd.Env = append(os.Environ(), extraEnv...)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gw create failed: %w: %s", err, tail(buf.String(), 600))
+	}
+	return nil
+}
+
+// Presets returns Grove presets as name → repo names (`gw preset list --json`).
+func Presets() (map[string][]string, error) {
+	out, err := exec.Command("gw", "preset", "list", "--json").Output()
+	if err != nil {
+		return nil, err
+	}
+	return ParsePresets(out)
+}
+
+// ParsePresets decodes `gw preset list --json` output.
+func ParsePresets(data []byte) (map[string][]string, error) {
+	var raw map[string]struct {
+		Repos []string `json:"repos"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	out := make(map[string][]string, len(raw))
+	for name, p := range raw {
+		out[name] = p.Repos
+	}
+	return out, nil
+}
+
+// Workspace mirrors the parts of one `gw list --json` entry gw-grab needs.
+type Workspace struct {
+	Name  string          `json:"name"`
+	Path  string          `json:"path"`
+	Repos []WorkspaceRepo `json:"repos"`
+}
+
+// WorkspaceRepo is one repo worktree inside a workspace.
+type WorkspaceRepo struct {
+	RepoName     string `json:"repo_name"`
+	WorktreePath string `json:"worktree_path"`
+}
+
+// FindWorkspace returns the workspace with the given name from `gw list --json`.
+func FindWorkspace(name string) (*Workspace, error) {
+	out, err := exec.Command("gw", "list", "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("gw list: %w", err)
+	}
+	return ParseWorkspace(out, name)
+}
+
+// ParseWorkspace picks one workspace by name out of `gw list --json` output.
+func ParseWorkspace(data []byte, name string) (*Workspace, error) {
+	var all []Workspace
+	if err := json.Unmarshal(data, &all); err != nil {
+		return nil, err
+	}
+	for i := range all {
+		if all[i].Name == name {
+			return &all[i], nil
+		}
+	}
+	return nil, fmt.Errorf("workspace %q not found in gw list", name)
+}
+
+func tail(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return "…" + s[len(s)-n:]
+	}
+	return s
 }

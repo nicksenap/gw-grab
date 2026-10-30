@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Grove dispatch</title>
+    <style>
+      :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #fff; --muted: #6b7280; --accent: #2f7d4f; --border: #d1d5db; --row: #f3f4f6; }
+      @media (prefers-color-scheme: dark) { :root { --fg: #e5e7eb; --bg: #18181b; --muted: #9ca3af; --border: #3f3f46; --row: #27272a; } }
+      body { font: 13px/1.45 system-ui, sans-serif; margin: 0; padding: 14px; color: var(--fg); background: var(--bg); }
+      h1 { font-size: 14px; margin: 0 0 10px; display: flex; justify-content: space-between; align-items: center; }
+      h1 button { margin: 0; width: auto; padding: 3px 9px; font-size: 12px; font-weight: 500; background: transparent; color: var(--muted); border: 1px solid var(--border); }
+      label { display: block; font-size: 12px; font-weight: 600; margin: 12px 0 4px; }
+      input, select, textarea { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--fg); font: inherit; }
+      textarea { min-height: 72px; resize: vertical; }
+      .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      ol#items { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+      ol#items li { background: var(--row); border-radius: 5px; padding: 6px 28px 6px 8px; position: relative; }
+      ol#items .t { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      ol#items .u, ol#items .s { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      ol#items .x { position: absolute; top: 4px; right: 4px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 15px; width: auto; margin: 0; padding: 0 5px; }
+      #empty { color: var(--muted); }
+      button { margin-top: 14px; width: 100%; padding: 9px; border: 0; border-radius: 5px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+      button:disabled { opacity: .5; cursor: default; }
+      button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); font-weight: 500; margin-top: 8px; padding: 6px; }
+      details { margin-top: 12px; color: var(--muted); }
+      details label { color: var(--fg); }
+      .status { margin-top: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+      .error { color: #b91c1c; }
+      .ok { color: var(--accent); }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>Grove dispatch <button id="clear" type="button">Clear</button></h1>
+
+    <div id="empty">Right-click a page, link or selection → <b>Add to Grove dispatch</b>, or press ⌘⇧G.</div>
+    <ol id="items"></ol>
+    <button id="addActive" type="button" class="secondary">+ Add this tab</button>
+
+    <form id="job">
+      <label for="prompt">Instruction</label>
+      <textarea id="prompt" placeholder="try this out…  (⌘↵ to dispatch)"></textarea>
+
+      <div class="row2">
+        <div>
+          <label for="target">Preset / repo</label>
+          <select id="target"></select>
+        </div>
+        <div>
+          <label for="startIn">Start agent in</label>
+          <select id="startIn"></select>
+        </div>
+      </div>
+
+      <label for="name">Workspace / branch</label>
+      <input id="name" type="text" autocomplete="off" spellcheck="false" />
+
+      <details>
+        <summary>Agent</summary>
+        <label for="agentCmd">Command</label>
+        <input id="agentCmd" type="text" autocomplete="off" spellcheck="false" />
+      </details>
+
+      <button type="submit" id="dispatch">Dispatch</button>
+      <div class="status" id="status"></div>
+    </form>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

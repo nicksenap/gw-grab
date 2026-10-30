@@ -1,207 +1,245 @@
-// Command gw-grab is a Grove plugin: `gw grab <url>` turns a GitHub PR, GitLab
-// MR, Notion page, or Slack message URL into a ready-to-work workspace.
+// Command gw-grab is a Grove plugin and Chrome native-messaging host. The
+// companion browser extension collects pages, links and selections (Slack,
+// Grafana, GitHub, anything) and sends them here; gw-grab creates a Grove
+// workspace, opens it as a background Herdr space and starts a coding agent
+// with the captures as its brief. Grove core does all the worktree/state work.
 //
-// It resolves intent (repo + branch + name) and shells out to `gw create` —
-// Grove core does all workspace/worktree/state work. Ground-truth values (a PR's
-// head branch) are extracted deterministically; the fuzzy gaps (Notion/Slack
-// branch naming and repo inference) are filled by a local Ollama model, which
-// degrades to a slug + repo picker when unavailable.
+// Page context comes from the already-authenticated browser, so there are no API
+// tokens here.
+//
+// Modes:
+//
+//	gw-grab <chrome-extension://ID/>   native-messaging host (Chrome launches this)
+//	gw-grab install-host <ext-id>      register the host manifest for Chrome
+//	gw-grab --from-capture             read one Capture JSON from stdin (testing)
+//	gw-grab --dispatch                 read one dispatch Job JSON from stdin and run it
+//	gw-grab --version | -h
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/nicksenap/gw-grab/internal/capture"
+	"github.com/nicksenap/gw-grab/internal/dispatch"
 	"github.com/nicksenap/gw-grab/internal/grove"
-	"github.com/nicksenap/gw-grab/internal/llm"
-	"github.com/nicksenap/gw-grab/internal/memory"
-	"github.com/nicksenap/gw-grab/internal/source"
+	"github.com/nicksenap/gw-grab/internal/herdr"
+	"github.com/nicksenap/gw-grab/internal/nativemsg"
+	"github.com/nicksenap/gw-grab/internal/resolver"
 )
-
-func main() {
-	args := os.Args[1:]
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		usage()
-		os.Exit(0)
-	}
-	if args[0] == "--version" {
-		fmt.Println(version)
-		os.Exit(0)
-	}
-
-	if err := run(args[0]); err != nil {
-		fmt.Fprintf(os.Stderr, "\033[1;31merror:\033[0m %s\n", err)
-		os.Exit(1)
-	}
-}
 
 var version = "dev"
 
-func run(url string) error {
-	cfg := loadConfig()
-
-	// 1. Parse the URL into deterministic facts.
-	sc, ok := source.ParseURL(url)
-	if !ok {
-		return fmt.Errorf("not a recognized source URL: %s\nSupported: GitHub PR, GitLab MR, Notion page, Slack message", url)
+func main() {
+	args := os.Args[1:]
+	switch {
+	case len(args) == 0 || args[0] == "-h" || args[0] == "--help":
+		usage()
+	case args[0] == "--version":
+		fmt.Println(version)
+	case args[0] == "install-host":
+		if len(args) < 2 {
+			fail("usage: gw grab install-host <chrome-extension-id>")
+		}
+		if err := installHost(args[1]); err != nil {
+			fail(err.Error())
+		}
+	case args[0] == "--from-capture":
+		if err := runFromCapture(os.Stdin); err != nil {
+			fail(err.Error())
+		}
+	case args[0] == "--dispatch":
+		ensurePath()
+		var j dispatch.Job
+		if err := json.NewDecoder(io.LimitReader(os.Stdin, nativemsg.MaxMessageSize)).Decode(&j); err != nil {
+			fail("invalid job JSON: " + err.Error())
+		}
+		resp := runDispatch(j, func(m string) { fmt.Fprintln(os.Stderr, m) })
+		out, _ := json.MarshalIndent(resp, "", "  ")
+		fmt.Println(string(out))
+		if resp.Error != "" {
+			os.Exit(1)
+		}
+	case strings.HasPrefix(args[0], "chrome-extension://"):
+		// Chrome launches the host with the extension origin as argv[1].
+		runHost()
+	default:
+		fail("unrecognized invocation; run `gw grab -h`")
 	}
+}
 
-	// 2. Resolve live metadata (PR head branch + title, Notion/Slack title).
-	ctx := context.Background()
-	source.Resolve(ctx, sc, source.Config{
-		NotionToken: cfg.notionToken,
-		SlackToken:  cfg.slackToken,
-	})
+// --- native messaging host loop ---
 
-	// 3. Determine repo + branch (deterministic where possible, else memory/LLM).
-	repos, _ := grove.Repos()
-	mem := memory.Load(memory.DefaultPath())
+// hostRequest is one message from the extension.
+type hostRequest struct {
+	Action  string            `json:"action"`  // "resolve" | "create" | "repos" | "options" | "dispatch"
+	Capture capture.Capture   `json:"capture"` // for resolve
+	Plan    resolver.Proposal `json:"plan"`    // for create (possibly edited in the panel)
+	Job     dispatch.Job      `json:"job"`     // for dispatch
+}
 
-	repoName, branch := resolve(ctx, cfg, sc, repos, mem)
+// hostResponse is one reply to the extension.
+type hostResponse struct {
+	OK       bool               `json:"ok"`
+	Error    string             `json:"error,omitempty"`
+	Proposal *resolver.Proposal `json:"proposal,omitempty"`
+	Repos    []grove.Repo       `json:"repos,omitempty"`
+	// options
+	Presets  map[string][]string `json:"presets,omitempty"`
+	AgentCmd string              `json:"agentCmd,omitempty"`
+	// dispatch: zero or more {progress} messages precede the final reply.
+	Progress string           `json:"progress,omitempty"`
+	Result   *dispatch.Result `json:"result,omitempty"`
+}
 
-	// 4. Derive a workspace name from the branch (grove derives this too, but we
-	//    want it visible in the preview).
-	name := deriveName(branch)
-
-	// 5. Preview + confirm (interactive only).
-	repoName, branch, name = previewAndConfirm(sc, repoName, branch, name, repos)
-	if branch == "" {
-		return fmt.Errorf("no branch resolved; aborting")
+func runHost() {
+	ensurePath()
+	for {
+		var req hostRequest
+		if err := nativemsg.Read(os.Stdin, &req); err != nil {
+			if err == io.EOF {
+				return // browser closed the port
+			}
+			_ = nativemsg.Write(os.Stdout, hostResponse{Error: err.Error()})
+			return
+		}
+		if req.Action == "dispatch" {
+			_ = nativemsg.Write(os.Stdout, runDispatch(req.Job, func(msg string) {
+				_ = nativemsg.Write(os.Stdout, hostResponse{Progress: msg})
+			}))
+			continue
+		}
+		_ = nativemsg.Write(os.Stdout, handle(req))
 	}
-	if repoName == "" {
-		return fmt.Errorf("no repo resolved; pass one or pick interactively")
+}
+
+func handle(req hostRequest) hostResponse {
+	switch req.Action {
+	case "repos":
+		repos, err := grove.Repos()
+		if err != nil {
+			return hostResponse{Error: "gw repos failed: " + err.Error()}
+		}
+		return hostResponse{OK: true, Repos: repos}
+
+	case "options":
+		presets, err := grove.Presets()
+		if err != nil {
+			return hostResponse{Error: "gw preset list failed: " + err.Error()}
+		}
+		repos, _ := grove.Repos()
+		return hostResponse{OK: true, Presets: presets, Repos: repos, AgentCmd: agentCmd()}
+
+	case "resolve":
+		repos, _ := grove.Repos()
+		p := resolver.Resolve(req.Capture, repos)
+		return hostResponse{OK: true, Proposal: &p}
+
+	case "create":
+		if err := create(req.Plan); err != nil {
+			return hostResponse{Error: err.Error()}
+		}
+		return hostResponse{OK: true}
+
+	default:
+		return hostResponse{Error: "unknown action: " + req.Action}
 	}
+}
 
-	// 6. Remember the signal→repo decision for next time.
-	_ = mem.Record(string(sc.Provider), sc.Signal, repoName)
-
-	// 7. Hand off to grove.
-	track := sc.BranchMode == source.BranchModeTrack
+// create drives `gw create` from a (possibly panel-edited) proposal.
+func create(p resolver.Proposal) error {
+	if p.RepoName == "" {
+		return fmt.Errorf("no repo selected")
+	}
+	if p.Branch == "" {
+		return fmt.Errorf("no branch")
+	}
+	name := p.Name
+	if name == "" {
+		name = deriveName(p.Branch)
+	}
 	return grove.Create(grove.CreateOpts{
 		Name:           name,
-		Branch:         branch,
-		Repo:           repoName,
-		Track:          track,
-		SourceURL:      sc.RawURL,
-		SourceProvider: string(sc.Provider),
-		SourceRef:      sc.Ref,
-		SourceTitle:    sc.Title,
+		Branch:         p.Branch,
+		Repo:           p.RepoName,
+		Track:          p.Track,
+		SourceURL:      p.SourceURL,
+		SourceProvider: p.Provider,
+		SourceRef:      p.SourceRef,
+		SourceTitle:    p.SourceTitle,
 	})
 }
 
-// resolve decides the repo and branch, using the cheapest correct source first:
-//   - branch: an already-resolved (PR/tree) branch wins; otherwise slug, with an
-//     LLM upgrade when available.
-//   - repo: a slug match (PR/MR) wins; else remembered signal→repo; else LLM
-//     inference; else empty (the picker handles it).
-func resolve(ctx context.Context, cfg config, sc *source.SourceContext, repos []grove.Repo, mem *memory.Store) (repoName, branch string) {
-	// Repo from an explicit slug (GitHub PR / GitLab MR).
-	if sc.RepoSlug != "" {
-		if name, ok := grove.MatchRepoSlug(repos, sc.RepoSlug); ok {
-			repoName = name
-		} else {
-			// Not cloned locally — hand grove the clone URL (it clones on miss).
-			repoName = httpsCloneURL(sc)
-		}
+// runDispatch creates the workspace, opens it as a background Herdr space and
+// starts the agent with the brief. GROVE_HERDR_OPEN=0 stops the post_create hook
+// from opening a focused space; we open it ourselves with --no-focus.
+func runDispatch(j dispatch.Job, progress func(string)) hostResponse {
+	if strings.TrimSpace(j.AgentCmd) == "" {
+		j.AgentCmd = agentCmd()
 	}
-
-	// Ground-truth branch already known (PR head / tree branch).
-	if sc.Branch != "" {
-		branch = sc.Branch
-	}
-
-	// If both are settled, we're done — no LLM needed (the common PR case).
-	if repoName != "" && branch != "" {
-		return repoName, branch
-	}
-
-	// Deterministic name fallback from the title.
-	if branch == "" {
-		branch = slugBranch(sc)
-	}
-
-	// Repo from memory (repeat sources skip the model entirely).
-	if repoName == "" {
-		if remembered, ok := mem.Lookup(string(sc.Provider), sc.Signal); ok {
-			repoName = remembered
-		}
-	}
-
-	// LLM only fills what's still missing, and only if it's actually up.
-	needsRepo := repoName == "" && len(repos) > 0
-	needsBetterName := sc.Title != "" // a model name beats a raw slug
-	if !needsRepo && !needsBetterName {
-		return repoName, branch
-	}
-
-	client := llm.New(cfg.ollamaEndpoint, cfg.model, cfg.timeout)
-	if !client.Available(ctx) {
-		if needsRepo {
-			fmt.Fprintln(os.Stderr, dim("(Ollama not reachable — using URL/slug heuristics; set up a model for smarter grabs)"))
-		}
-		return repoName, branch
-	}
-
-	sug, err := client.Suggest(ctx, llm.Request{
-		Title:          sc.Title,
-		Repos:          grove.Names(repos),
-		BranchExamples: grove.BranchExamples(repoPath(repos, repoName), 15),
-		PriorMappings:  mem.RecentMappings(10),
+	helper := herdr.DefaultHelper()
+	res, err := dispatch.Run(j, dispatch.Deps{
+		Create:        func(o grove.CreateOpts) error { return grove.Create(o, "GROVE_HERDR_OPEN=0") },
+		FindWorkspace: grove.FindWorkspace,
+		OpenHerdr:     func(path, label string) (string, error) { return herdr.Open(helper, path, label) },
+		FirstPane:     herdr.FirstPane,
+		RunInPane:     herdr.Run,
+		BriefDir:      briefDir(),
+		Progress:      progress,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, dim("(local model timed out — using slug heuristics)"))
-		return repoName, branch
+		return hostResponse{Error: err.Error(), Result: &res}
 	}
-
-	if needsRepo && sug.Repo != "" && sug.Confidence >= cfg.minConfidence {
-		if name, ok := grove.MatchRepoSlug(repos, sug.Repo); ok {
-			repoName = name
-		}
-	}
-	if sug.Branch != "" {
-		if b := source.Slugify(sug.Branch, 50); b != "" {
-			branch = b
-		}
-	}
-	return repoName, branch
+	return hostResponse{OK: true, Result: &res}
 }
 
-// slugBranch builds a deterministic branch name from the source title/ref.
-func slugBranch(sc *source.SourceContext) string {
-	if b := source.Slugify(sc.Title, 50); b != "" {
-		return b
+func briefDir() string {
+	dir := os.Getenv("GROVE_DIR")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".grove")
 	}
-	switch sc.Provider {
-	case source.ProviderGitHub, source.ProviderGitLab:
-		if sc.Ref != "" {
-			return "pr-" + sc.Ref
-		}
-	case source.ProviderSlack:
-		return source.Slugify("slack "+sc.Signal+" "+strings.SplitN(sc.Ref, ".", 2)[0], 50)
-	}
-	return source.Slugify(string(sc.Provider)+"-"+sc.Ref, 50)
+	return filepath.Join(dir, "grab", "briefs")
 }
 
-func repoPath(repos []grove.Repo, name string) string {
-	for _, r := range repos {
-		if r.Name == name {
-			return r.Path
+// ensurePath adds the usual tool dirs: Chrome launches native hosts with a
+// minimal PATH, so gw/herdr (Homebrew, ~/go/bin) would not be found.
+func ensurePath() {
+	home, _ := os.UserHomeDir()
+	have := map[string]bool{}
+	parts := filepath.SplitList(os.Getenv("PATH"))
+	for _, p := range parts {
+		have[p] = true
+	}
+	for _, p := range []string{"/opt/homebrew/bin", "/usr/local/bin", filepath.Join(home, "go", "bin"), filepath.Join(home, ".local", "bin")} {
+		if !have[p] {
+			parts = append(parts, p)
 		}
 	}
-	return ""
+	_ = os.Setenv("PATH", strings.Join(parts, string(os.PathListSeparator)))
 }
 
-// httpsCloneURL reconstructs a clone URL for an uncloned GitHub/GitLab repo.
-func httpsCloneURL(sc *source.SourceContext) string {
-	switch sc.Provider {
-	case source.ProviderGitHub:
-		return "https://github.com/" + sc.RepoSlug + ".git"
-	case source.ProviderGitLab:
-		return "https://gitlab.com/" + sc.RepoSlug + ".git"
+// --- --from-capture (testing / scripting without the browser) ---
+
+func runFromCapture(r io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(r, nativemsg.MaxMessageSize))
+	if err != nil {
+		return err
 	}
-	return ""
+	var cap capture.Capture
+	if err := json.Unmarshal(data, &cap); err != nil {
+		return fmt.Errorf("invalid capture JSON: %w", err)
+	}
+	repos, _ := grove.Repos()
+	p := resolver.Resolve(cap, repos)
+	// Print the resolved plan so it can be inspected, then create.
+	pretty, _ := json.MarshalIndent(p, "", "  ")
+	fmt.Fprintln(os.Stderr, string(pretty))
+	return create(p)
 }
 
 func deriveName(branch string) string {
@@ -210,23 +248,27 @@ func deriveName(branch string) string {
 	return strings.Trim(name, "-")
 }
 
-func dim(s string) string { return "\033[2m" + s + "\033[0m" }
+func fail(msg string) {
+	fmt.Fprintf(os.Stderr, "\033[1;31merror:\033[0m %s\n", msg)
+	os.Exit(1)
+}
 
 func usage() {
-	fmt.Print(`gw grab — create a workspace from a PR, task, or thread URL
+	fmt.Print(`gw grab — create a Grove workspace from your browser
 
-Usage:
-  gw grab <url>
+gw-grab is the native-messaging host for the gw-grab Chrome extension.
+You normally trigger it from the browser (right-click → "Grab into Grove",
+the toolbar icon, or the keyboard shortcut), not from the terminal.
 
-Supported URLs:
-  GitHub PR     https://github.com/owner/repo/pull/123
-  GitLab MR     https://gitlab.com/group/repo/-/merge_requests/123
-  Notion page   https://www.notion.so/.../Title-<pageid>
-  Slack message https://team.slack.com/archives/<channel>/p<ts>
+One-time setup:
+  gw grab install-host <chrome-extension-id>   register this host with Chrome
 
-Setup:
-  Requires the Grove CLI (gw). For smart branch naming and repo inference on
-  Notion/Slack URLs, install Ollama and pull a small model (see README).
-  Optional: NOTION_TOKEN / SLACK_TOKEN for richer titles.
+Other:
+  gw grab --from-capture     read a Capture JSON from stdin and create (testing)
+  gw grab --dispatch         read a dispatch Job JSON from stdin: create workspace,
+                             open background Herdr space, start the agent
+  gw grab --version
+
+See the README for installing the extension.
 `)
 }
